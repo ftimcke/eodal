@@ -79,6 +79,10 @@ def preprocess_sentinel2_scenes(
 
 if __name__ == '__main__':
 
+    import os
+    cwd = Path(__file__).absolute().parent.parent
+    os.chdir(cwd)
+
     # user-inputs
     # -------------------------- Collection -------------------------------
     collection: str = 'sentinel2-msi'
@@ -89,6 +93,7 @@ if __name__ == '__main__':
 
     # ---------------------- Spatial Feature  ------------------------------
     geom: Path = Path('data/sample_polygons/lake_lucerne.gpkg')
+    feature = Feature.from_geoseries(gpd.read_file(geom).geometry)
 
     # ------------------------- Metadata Filters ---------------------------
     metadata_filters: List[Filter] = [
@@ -96,8 +101,7 @@ if __name__ == '__main__':
         Filter('processing_level', '==', 'Level-2A')
     ]
 
-    # query the scenes available (no I/O of scenes, this only fetches metadata)
-    feature = Feature.from_geoseries(gpd.read_file(geom).geometry)
+    # set up the Mapper configuration
     mapper_configs = MapperConfigs(
         collection=collection,
         time_start=time_start,
@@ -115,17 +119,21 @@ if __name__ == '__main__':
     # the metadata is loaded into a GeoPandas GeoDataFrame
     mapper.metadata
 
-    # get the least cloudy scene
-    mapper.metadata = mapper.metadata[
-          mapper.metadata.cloudy_pixel_percentage ==
-          mapper.metadata.cloudy_pixel_percentage.min()].copy()
+    # optional: get the least cloudy scene
+    # to apply it uncomment the statement below. This
+    # will return just a single scene no matter how long the time period chosen.
+    # mapper.metadata = mapper.metadata[
+    #       mapper.metadata.cloudy_pixel_percentage ==
+    #       mapper.metadata.cloudy_pixel_percentage.min()].copy()
 
-    # load the least cloudy scene available from STAC
+    # we tell EOdal how to load the Sentinel-2 scenes using `Sentinel2.from_safe`
+    # and pass on some kwargs, e.g., the selection of bands we want to read.
     scene_kwargs = {
         'scene_constructor': Sentinel2.from_safe,
         'scene_constructor_kwargs': {'band_selection':
-                                     ["B02", "B03", "B04", "B05", "B8A"]}}
-
+                                     ['B02', 'B03', 'B04', 'B08'],
+                                     'read_scl': False}}
+    # load the scenes available from STAC
     mapper.load_scenes(scene_kwargs=scene_kwargs)
     # the data loaded into `mapper.data` as a EOdal SceneCollection
     mapper.data
