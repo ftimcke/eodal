@@ -26,9 +26,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 import cv2
+import numpy as np
 import pandas as pd
 import planetary_computer
 
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -88,10 +90,10 @@ class Landsat(RasterCollection):
         Check which Landsat platform (spacecraft) produced the data.
         """
         if isinstance(in_dir, dict):
-            # the blue band is always available
-            test_band = in_dir['blue']['href'].split('/')[-1]
+            # the green band should be always available
+            test_band = in_dir['green']['href'].split('/')[-1]
         elif isinstance(in_dir, Path):
-            test_band = in_dir.glob("*_B2.TIF")[0]
+            test_band = in_dir.glob("*_B*.TIF")[0]
         # get the platform from the band name
         platform = test_band.split('_')[0]
         return platform
@@ -111,8 +113,8 @@ class Landsat(RasterCollection):
             Product URI.
         """
         if isinstance(in_dir, dict):
-            # the blue band is always available
-            test_band = in_dir['blue']['href'].split('/')[-1]
+            # the green band should be always available
+            test_band = in_dir['green']['href'].split('/')[-1]
         elif isinstance(in_dir, Path):
             test_band = in_dir.glob("*.TIF")[0]
         # get the product URI from the band name
@@ -134,8 +136,8 @@ class Landsat(RasterCollection):
             Sensing time.
         """
         if isinstance(in_dir, dict):
-            # the blue band is always available
-            test_band = in_dir['blue']['href'].split('/')[-1]
+            # the green band should be always available
+            test_band = in_dir['red']['href'].split('/')[-1]
         elif isinstance(in_dir, Path):
             test_band = in_dir.glob("*.TIF")[0]
         # get the sensing time from the band name
@@ -341,6 +343,13 @@ class Landsat(RasterCollection):
         sensing_time = cls._sensing_time_from_filename(in_dir=in_dir)
         # get the product uri
         product_uri = cls._product_uri_from_filename(in_dir=in_dir)
+        # determine processing level
+        if sensor in \
+            ['Multispectral_Scanner_System_L1-3',
+             'Multispectral_Scanner_System_L4-5']:
+            processing_level = ProcessingLevels.L1C
+        else:
+            processing_level = ProcessingLevels.L2A
 
         # construct the SceneProperties object
         scene_properties = SceneProperties(
@@ -348,12 +357,14 @@ class Landsat(RasterCollection):
             sensor=sensor,
             acquisition_time=sensing_time,
             product_uri=product_uri,
-            processing_level=ProcessingLevels.L2A  # currently we only support L2A
+            processing_level=processing_level
         )
 
         # set proper scaling factors to allow for conversion to
         # reflectance [0, 1]
-        gain, offset = 0.00001, 0.0
+        gain, offset = 0, 1
+        if processing_level == ProcessingLevels.L2A:
+            gain, offset = 0.00001, 0.0
 
         # loop over bands and add them to the collection of bands
         landsat = cls(scene_properties=scene_properties)
@@ -421,3 +432,159 @@ class Landsat(RasterCollection):
                 pixel_values_to_ignore=[landsat[landsat.band_names[0]].nodata],
             )
         return landsat
+
+    def mask_from_qa_bits(
+            self,
+            bit_range: tuple,
+            band_name: Optional[str] = 'qa_pixel'
+    ) -> np.ndarray | np.ma.MaskedArray:
+        """
+        Extract Quality Accurance (QA) bits from the QA band of
+        Landsat to obtain a binary mask.
+
+        This function can be used to obtain a binary cloud or
+        cloud shadow mask, for example.
+
+        :param bit_range:
+            A tuple of two integers indicating the start and end bit
+            of the bit range to extract.
+        :param band_name:
+            The name of the QA band. Default is 'qa_pixel'.
+        :return:
+            A 2-dimensional numpy array containing the obtained mask.
+        """
+        # get the band
+        band = deepcopy(self[band_name].values)
+        band_mask = None
+        if isinstance(band, np.ndarray):
+            band_data = band
+        elif isinstance(band, np.ma.MaskedArray):
+            band_data = band.data
+            band_mask = band.mask
+        # compute the bits to extract
+        pattern = 0
+        for i in range(bit_range[0], bit_range[1] + 1):
+            pattern += 2 ** i
+        # assign the extracted bits to the band
+        band_data = np.bitwise_and(band_data, pattern)
+        band_data = np.right_shift(band_data, bit_range[0])
+
+        # create a masked array if the input was also masked
+        if band_mask is not None:
+            band_data = np.ma.MaskedArray(
+                data=band_data,
+                mask=band_mask
+            )
+
+        return band_data
+
+    def mask_clouds_and_shadows(
+            self,
+            bands_to_mask: Optional[list[str]] = None,
+            cloud_classes: Optional[list[int]] = [1, 2, 3, 5],
+            mask_band: Optional[str] = 'qa_pixel',
+            **kwargs
+    ) -> None | Landsat:
+        """
+        A wrapper around the inherited ``mask`` method to mask cirrus,
+        cloud and cloud shadow pixels in Landsat scenes based on the
+        pixel quality band.
+
+        NOTE:
+            Since the `mask_band` can be set to *any* `Band` it is also
+            possible to use a different cloud/shadow etc. mask, e.g., from
+            a custom classifier as long as the bit map used for the classes
+            is the same.
+            See also
+            https://www.usgs.gov/media/images/landsat-collection-2-pixel-quality-assessment-bit-index
+            for more details.
+
+        NOTE:
+            You might also use the mask function from
+            `eodal.core.raster.RasterCollection` directly.
+
+        :param bands_to_mask:
+            A list of bands to mask. Default is all bands.
+        :param cloud_classes:
+            A list of integers indicating the cloud classes to mask.
+            Default is [1, 2, 3, 5].
+        :param mask_band:
+            The name of the band to use for masking. Default is 'qa_pixel'.
+        :param kwargs:
+            optional kwargs to pass to `~eodal.core.raster.RasterCollection.mask`
+        :returns:
+            depending on `inplace` (passed in the kwargs) a new `Sentinel2` instance
+            or None
+        """
+        if bands_to_mask is None:
+            bands_to_mask = self.band_names
+        # the mask band should never be masked
+        if mask_band in bands_to_mask:
+            bands_to_mask.remove(mask_band)
+        try:
+            mask_list = []
+            for cloud_class in cloud_classes:
+                # construct the bit range
+                bit_range = (cloud_class, cloud_class)
+                # get the binary mask as boolean array
+                mask = self.mask_from_qa_bits(
+                    bit_range=bit_range,
+                    band_name=mask_band).astype('bool')
+                # add the mask to the list
+                mask_list.append(mask)
+
+            # combine the masks
+            cloud_mask = np.any(mask_list, axis=0)
+            # mask the bands
+            return self.mask(
+                mask=cloud_mask,
+                bands_to_mask=bands_to_mask,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"Could not mask clouds and shadows: {e}")
+
+    def get_water_mask(
+            self,
+            mask_band: Optional[str] = 'qa_pixel',
+            inplace: Optional[bool] = False,
+            name_water_mask: Optional[str] = 'water_mask'
+    ) -> Band | None:
+        """
+        Get a water mask from the pixel quality band (bit 7).
+
+        NOTE:
+            Since the `mask_band` can be set to *any* `Band` it is also
+            possible to use a different water mask, e.g., from
+            a custom classifier as long as the bit map used for the classes
+            is the same.
+            See also
+            https://www.usgs.gov/media/images/landsat-collection-2-pixel-quality-assessment-bit-index
+            for more details.
+
+        :param mask_band:
+            The name of the band to use for masking. Default is 'qa_pixel'.
+        :param inplace:
+            Whether to return a new `Band` instance or add a `Band` to the
+            current `Landsat` instance. Default is False.
+        :param name_water_mask:
+            The name of the water mask band. Default is 'water_mask'.
+        :return:
+            A `Band` instance containing the water mask or `None` if
+            `inplace` is True.
+        """
+        water_mask = self.mask_from_qa_bits(
+            bit_range=(7, 7),
+            band_name=mask_band
+        )
+        water_mask_band = Band(
+                band_name=name_water_mask,
+                values=water_mask,
+                geo_info=self[mask_band].geo_info,
+                nodata=0,
+            )
+        if inplace:
+            self.add_band(water_mask_band)
+            return None
+        else:
+            return water_mask_band
